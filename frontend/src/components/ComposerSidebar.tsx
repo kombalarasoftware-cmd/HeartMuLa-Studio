@@ -12,7 +12,7 @@ interface ComposerSidebarProps {
     lyricsModels: LLMModel[];
     modelsLoaded?: boolean;
     languages: string[];
-    onGenerateLyrics: (topic: string, modelId: string, provider: string, language: string, currentLyrics?: string) => Promise<{ lyrics: string; suggested_topic: string; suggested_tags: string }>;
+    onGenerateLyrics: (topic: string, modelId: string, provider: string, language: string, currentLyrics?: string, durationSeconds?: number) => Promise<{ lyrics: string; suggested_topic: string; suggested_tags: string }>;
     isGeneratingLyrics: boolean;
     currentJobId?: string;
     onCancel?: (jobId: string) => void;
@@ -220,7 +220,7 @@ export const ComposerSidebar: React.FC<ComposerSidebarProps> = ({
         try {
             // Don't pass existing lyrics as seed - generate fresh each time
             // This way clicking the wand always generates new lyrics instead of "continuing" existing ones
-            const result = await onGenerateLyrics(topic, currentModel.id, currentModel.provider, selectedLanguage);
+            const result = await onGenerateLyrics(topic, currentModel.id, currentModel.provider_id, selectedLanguage, undefined, duration);
             // Always update with AI-generated content
             if (result.lyrics) {
                 setLyrics(result.lyrics);
@@ -413,8 +413,8 @@ export const ComposerSidebar: React.FC<ComposerSidebarProps> = ({
                                 <option value={0}>{modelsLoaded ? 'No LLM (optional)' : 'Loading...'}</option>
                             ) : (
                                 lyricsModels.map((m, idx) => (
-                                    <option key={m.id} value={idx}>
-                                        {m.name}
+                                    <option key={`${m.provider_id}_${m.id}`} value={idx}>
+                                        {m.name} ({m.provider_name})
                                     </option>
                                 ))
                             )}

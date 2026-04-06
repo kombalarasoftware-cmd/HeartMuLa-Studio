@@ -50,7 +50,7 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 # HuggingFace model IDs (base repos - version is appended for HeartMuLa)
-HF_HEARTCODEC_REPO = "HeartMuLa/HeartCodec-oss"
+HF_HEARTCODEC_REPO = "HeartMuLa/HeartCodec-oss-20260123"
 HF_HEARTMULA_GEN_REPO = "HeartMuLa/HeartMuLaGen"  # Contains tokenizer.json and gen_config.json
 
 # Model version mapping - maps version to (HuggingFace repo, local folder name)
@@ -955,13 +955,8 @@ class MusicService:
                 "torch_compile_mode": "default",
                 # mmgp-specific settings
                 "mmgp_quantization": "false",  # "true" for INT8, "false" for bf16 (faster)
-                # LLM Provider settings
-                "ollama_host": "",
-                "openrouter_api_key": "",
-                # Custom API settings
-                "custom_api_base_url": "",
-                "custom_api_key": "",
-                "custom_api_model": ""
+                # Multi-provider LLM settings (replaces old ollama_host/openrouter_api_key/custom_api_*)
+                "llm_providers": []
             }
             # Load persisted settings from disk (overrides defaults)
             cls._instance._load_settings()
@@ -1006,23 +1001,28 @@ class MusicService:
                         TORCH_COMPILE_MODE = saved["torch_compile_mode"]
                         _COMPILE_MODE_ENV = saved["torch_compile_mode"]
 
-                    # Apply LLM settings
+                    # Apply LLM providers (multi-provider)
                     from backend.app.services.llm_service import LLMService
-                    if "ollama_host" in saved and saved["ollama_host"]:
-                        LLMService.update_settings(ollama_host=saved["ollama_host"])
-                    if "openrouter_api_key" in saved and saved["openrouter_api_key"]:
-                        LLMService.update_settings(openrouter_api_key=saved["openrouter_api_key"])
-                    # Apply Custom API settings
-                    if "custom_api_base_url" in saved:
-                        LLMService.update_settings(custom_api_base_url=saved["custom_api_base_url"])
-                    if "custom_api_key" in saved:
-                        LLMService.update_settings(custom_api_key=saved["custom_api_key"])
-                    if "custom_api_model" in saved:
-                        LLMService.update_settings(custom_api_model=saved["custom_api_model"])
+                    if "llm_providers" in saved and saved["llm_providers"]:
+                        LLMService.init_providers(saved["llm_providers"])
+                    else:
+                        # Backward compat: migrate old settings or use env defaults
+                        LLMService.init_providers(None)
 
-                    logger.info(f"[Settings] Loaded from {SETTINGS_FILE}: {self.current_settings}")
+                    logger.info(f"[Settings] Loaded from {SETTINGS_FILE}")
+            else:
+                # No settings file — initialize LLM providers from environment
+                from backend.app.services.llm_service import LLMService
+                LLMService.init_providers(None)
+                logger.info("[Settings] No settings file found, initialized from environment")
         except Exception as e:
             logger.warning(f"[Settings] Failed to load settings: {e}")
+            # Ensure LLM providers are initialized even on error
+            try:
+                from backend.app.services.llm_service import LLMService
+                LLMService.init_providers(None)
+            except Exception:
+                pass
 
     def _save_settings(self):
         """Save settings to persistent storage."""

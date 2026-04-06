@@ -1,5 +1,5 @@
-import { useState, useEffect } from 'react';
-import { api, type LLMModel, type StartupStatus, type GPUStatus, type GPUSettings, type LLMSettings } from './api';
+import { useState, useEffect, useCallback } from 'react';
+import { api, type LLMModel, type StartupStatus, type GPUStatus, type GPUSettings, type VideoJob } from './api';
 import type { Job } from './api';
 import { ComposerSidebar } from './components/ComposerSidebar';
 import type { CompositionData } from './components/ComposerSidebar';
@@ -10,12 +10,51 @@ import { LibrarySidebar } from './components/LibrarySidebar';
 import { AddToPlaylistModal } from './components/AddToPlaylistModal';
 import { StartupScreen } from './components/StartupScreen';
 import { SettingsModal } from './components/SettingsModal';
-import { Moon, Sun, PanelRightOpen, PanelLeftClose, PanelLeftOpen, Heart, ListMusic, Home, Plus, X, Settings } from 'lucide-react';
+import { VideoGeneratorModal } from './components/VideoGeneratorModal';
+import { LoginPage } from './components/LoginPage';
+import { Moon, Sun, PanelRightOpen, PanelLeftClose, PanelLeftOpen, Heart, ListMusic, Home, Plus, X, Settings, LogOut } from 'lucide-react';
 import { HeartMuLaLogo } from './components/HeartMuLaLogo';
 
 type ActiveSection = 'home' | 'favourites' | 'playlists';
 
+interface AuthUser {
+  id: string;
+  name: string;
+  email: string;
+}
+
 function App() {
+  // Auth state
+  const [authToken, setAuthToken] = useState<string | null>(() => localStorage.getItem('heartmula_token'));
+  const [authUser, setAuthUser] = useState<AuthUser | null>(() => {
+    const saved = localStorage.getItem('heartmula_user');
+    return saved ? JSON.parse(saved) : null;
+  });
+
+  const handleLogin = useCallback((token: string, user: AuthUser) => {
+    setAuthToken(token);
+    setAuthUser(user);
+    localStorage.setItem('heartmula_token', token);
+    localStorage.setItem('heartmula_user', JSON.stringify(user));
+    // Set token for axios interceptor
+    api.setAuthToken(token);
+  }, []);
+
+  const handleLogout = useCallback(() => {
+    setAuthToken(null);
+    setAuthUser(null);
+    localStorage.removeItem('heartmula_token');
+    localStorage.removeItem('heartmula_user');
+    api.setAuthToken(null);
+  }, []);
+
+  // Initialize auth token on mount
+  useEffect(() => {
+    if (authToken) {
+      api.setAuthToken(authToken);
+    }
+  }, []);
+
   const [lyricsModels, setLyricsModels] = useState<LLMModel[]>([]);
   const [modelsLoaded, setModelsLoaded] = useState(false);
   const [languages, setLanguages] = useState<string[]>([]);
@@ -55,8 +94,12 @@ function App() {
   const [isStartupComplete, setIsStartupComplete] = useState(false);
   const [gpuStatus, setGpuStatus] = useState<GPUStatus | null>(null);
   const [gpuSettings, setGpuSettings] = useState<GPUSettings | null>(null);
-  const [llmSettings, setLlmSettings] = useState<LLMSettings | null>(null);
   const [settingsModalOpen, setSettingsModalOpen] = useState(false);
+
+  // Video generation state
+  const [videoModalOpen, setVideoModalOpen] = useState(false);
+  const [videoModalJob, setVideoModalJob] = useState<Job | null>(null);
+  const [currentVideoJob, setCurrentVideoJob] = useState<VideoJob | null>(null);
 
   // Handler for previewing reference audio in the bottom player
   const handlePreviewRefAudio = (url: string, filename: string) => {
@@ -108,14 +151,12 @@ function App() {
 
     const loadGpuInfo = async () => {
       try {
-        const [status, settings, llm] = await Promise.all([
+        const [status, settings] = await Promise.all([
           api.getGPUStatus(),
-          api.getGPUSettings(),
-          api.getLLMSettings()
+          api.getGPUSettings()
         ]);
         setGpuStatus(status);
         setGpuSettings(settings);
-        setLlmSettings(llm);
       } catch (e) {
         console.log("Settings not available yet");
       }
@@ -260,8 +301,24 @@ function App() {
             // Reload GPU info and settings after startup completes
             api.getGPUStatus().then(setGpuStatus).catch(() => {});
             api.getGPUSettings().then(setGpuSettings).catch(() => {});
-            api.getLLMSettings().then(setLlmSettings).catch(() => {});
+            // Refresh lyrics models after startup
+            api.getLyricsModels().then(setLyricsModels).catch(() => {});
           }
+        }
+
+        // Video generation progress
+        if (type === 'video_progress' || type === 'video_update') {
+          setCurrentVideoJob(prev => {
+            if (!prev || prev.id !== data.video_job_id) return prev;
+            return {
+              ...prev,
+              status: data.status,
+              completed_clips: data.completed_clips ?? prev.completed_clips,
+              total_clips: data.total_clips ?? prev.total_clips,
+              video_path: data.video_path ?? prev.video_path,
+              error_msg: data.error ?? prev.error_msg,
+            };
+          });
         }
       } catch (err) {
         console.error("SSE Parse Error", err);
@@ -316,10 +373,10 @@ function App() {
     }
   };
 
-  const handleGenerateLyrics = async (topic: string, modelId: string, provider: string, language: string, currentLyrics?: string) => {
+  const handleGenerateLyrics = async (topic: string, modelId: string, provider: string, language: string, currentLyrics?: string, durationSeconds?: number) => {
     setIsGeneratingLyrics(true);
     try {
-      const result = await api.generateLyrics(topic, modelId, provider, currentLyrics, language);
+      const result = await api.generateLyrics(topic, modelId, provider, currentLyrics, language, durationSeconds);
       return result;
     } finally {
       setIsGeneratingLyrics(false);
@@ -432,10 +489,20 @@ function App() {
     // Progress will be tracked via SSE events
   };
 
-  const handleSaveLLMSettings = async (settings: { ollama_host?: string; openrouter_api_key?: string }) => {
-    const updated = await api.updateLLMSettings(settings);
-    setLlmSettings(updated);
+  const handleProvidersChanged = async () => {
+    // Refresh lyrics models list when providers/models change in settings
+    try {
+      const models = await api.getLyricsModels();
+      setLyricsModels(models);
+    } catch (e) {
+      console.error("Failed to refresh lyrics models:", e);
+    }
   };
+
+  // Auth gate — show login page if not authenticated
+  if (!authToken || !authUser) {
+    return <LoginPage onLogin={handleLogin} />;
+  }
 
   // Show startup screen until ready
   if (!isStartupComplete) {
@@ -493,7 +560,7 @@ function App() {
           })}
         </nav>
 
-        {/* Right: Settings & Dark Mode Toggle */}
+        {/* Right: Settings, Dark Mode & Logout */}
         <div className="flex items-center gap-2">
           <button
             onClick={() => setSettingsModalOpen(true)}
@@ -508,6 +575,13 @@ function App() {
             title={darkMode ? 'Switch to Light Mode' : 'Switch to Dark Mode'}
           >
             {darkMode ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
+          </button>
+          <button
+            onClick={handleLogout}
+            className={`p-2 rounded-full transition-all ${darkMode ? 'hover:bg-[#282828] text-[#b3b3b3] hover:text-red-400' : 'hover:bg-slate-100 text-slate-500 hover:text-red-500'}`}
+            title={`Logout (${authUser?.name})`}
+          >
+            <LogOut className="w-4 h-4" />
           </button>
         </div>
       </header>
@@ -632,6 +706,10 @@ function App() {
               onAddToPlaylist={(job) => setPlaylistModalSong(job)}
               onSelectTrack={(job) => {
                 setSelectedHomeTrack(job);
+                // Auto-play when selecting a completed track
+                if (job.status === 'completed' && job.audio_path) {
+                  handlePlayTrack(job);
+                }
                 // Only auto-show sidebar on desktop
                 const isDesktop = window.matchMedia('(min-width: 768px)').matches;
                 if (isDesktop) {
@@ -653,7 +731,13 @@ function App() {
                 isTrackPlaying={isPlaying}
                 onRefreshLikes={loadLikedIds}
                 initialView={activeSection === 'favourites' ? 'liked' : 'library'}
-                onSelectTrack={(track) => setSelectedLibraryTrack(track)}
+                onSelectTrack={(track) => {
+                  setSelectedLibraryTrack(track);
+                  // Auto-play when selecting a completed track from library
+                  if (track.status === 'completed' && track.audio_path) {
+                    handlePlayTrack(track);
+                  }
+                }}
                 selectedTrackId={selectedLibraryTrack?.id}
                 onToggleLike={handleToggleLike}
                 onAddToPlaylist={(job) => setPlaylistModalSong(job)}
@@ -683,6 +767,14 @@ function App() {
               isLiked={likedIds.has(trackForSidebar.id)}
               onToggleLike={() => handleToggleLike(trackForSidebar.id, likedIds.has(trackForSidebar.id))}
               onAddToPlaylist={() => setPlaylistModalSong(trackForSidebar)}
+              onGenerateVideo={() => {
+                setVideoModalJob(trackForSidebar);
+                // Check for existing video job
+                api.getLatestVideoForSong(trackForSidebar.id).then(res => {
+                  setCurrentVideoJob(res.video_job ?? null);
+                }).catch(() => setCurrentVideoJob(null));
+                setVideoModalOpen(true);
+              }}
             />
           );
         })()}
@@ -732,6 +824,16 @@ function App() {
         darkMode={darkMode}
       />
 
+      {/* Video Generator Modal */}
+      <VideoGeneratorModal
+        isOpen={videoModalOpen}
+        onClose={() => setVideoModalOpen(false)}
+        darkMode={darkMode}
+        job={videoModalJob}
+        videoJob={currentVideoJob}
+        onVideoJobUpdate={setCurrentVideoJob}
+      />
+
       {/* Settings Modal */}
       <SettingsModal
         isOpen={settingsModalOpen}
@@ -742,8 +844,7 @@ function App() {
         onSave={handleSaveSettings}
         onReload={handleReloadModels}
         startupStatus={startupStatus}
-        llmSettings={llmSettings}
-        onSaveLLM={handleSaveLLMSettings}
+        onProvidersChanged={handleProvidersChanged}
       />
     </div>
   );

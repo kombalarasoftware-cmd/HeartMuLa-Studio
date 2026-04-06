@@ -19,10 +19,16 @@ from backend.app.models import (
     Job, JobStatus, GenerationRequest, LyricsRequest, EnhancePromptRequest, InspirationRequest,
     LikedSong, Playlist, PlaylistSong, CreatePlaylistRequest, UpdatePlaylistRequest, AddToPlaylistRequest,
     GPUSettingsRequest, GPUSettingsResponse, GPUStatusResponse, StartupStatusResponse, ModelReloadResponse,
-    LLMSettingsRequest, LLMSettingsResponse
+    LLMProviderRequest, LLMProviderResponse, LLMToggleModelRequest, LLMActiveModel,
+    VideoJob, VideoJobStatus, VideoGenerateRequest, VertexAISettingsRequest
 )
 from backend.app.services.music_service import music_service
 from backend.app.services.llm_service import LLMService
+from backend.app.services.transcription_service import transcription_service
+from backend.app.services.video_service import video_service
+from backend.app.services.vertex_ai_service import vertex_ai_service
+from backend.app.services.auth_service import auth_service, verify_jwt, seed_super_admin
+from backend.app.models import User
 
 # Database - configurable path for Docker support
 sqlite_file_name = os.environ.get("HEARTMULA_DB_PATH", "backend/jobs.db")
@@ -46,11 +52,41 @@ def run_migrations():
         except Exception:
             pass  # Column already exists
 
+        # Add password_hash column to user table
+        try:
+            conn.execute(text("ALTER TABLE user ADD COLUMN password_hash TEXT"))
+            conn.commit()
+            print("[Migration] Added password_hash column to user table")
+        except Exception:
+            pass
+
+        # Add is_admin column to user table
+        try:
+            conn.execute(text("ALTER TABLE user ADD COLUMN is_admin BOOLEAN DEFAULT 0"))
+            conn.commit()
+            print("[Migration] Added is_admin column to user table")
+        except Exception:
+            pass
+
 # Lifespan
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     create_db_and_tables()
     run_migrations()
+    # Seed super admin user
+    with Session(engine) as session:
+        seed_super_admin(session)
+    # Initialize Vertex AI from saved settings
+    saved_vertex = music_service.current_settings.get("vertex_ai", {})
+    if saved_vertex and saved_vertex.get("service_account_json"):
+        try:
+            vertex_ai_service.configure(
+                service_account_json=saved_vertex["service_account_json"],
+                project_id=saved_vertex.get("project_id", ""),
+                location=saved_vertex.get("location", "us-central1"),
+            )
+        except Exception as e:
+            print(f"[Startup] Vertex AI init failed: {e}")
     # Start model initialization in background - server starts immediately
     # Frontend can connect and show progress via SSE
     asyncio.create_task(music_service.initialize_with_progress())
@@ -76,7 +112,127 @@ app.mount("/audio", StaticFiles(directory="backend/generated_audio"), name="audi
 # Reference Audio Storage
 REF_AUDIO_DIR = "backend/ref_audio"
 os.makedirs(REF_AUDIO_DIR, exist_ok=True)
+
+# Video Output Storage
+VIDEO_OUTPUT_DIR = "backend/generated_videos"
+os.makedirs(VIDEO_OUTPUT_DIR, exist_ok=True)
+app.mount("/video", StaticFiles(directory=VIDEO_OUTPUT_DIR), name="video")
 app.mount("/ref_audio", StaticFiles(directory=REF_AUDIO_DIR), name="ref_audio")
+
+# --- Auth Dependency ---
+
+from fastapi import Header
+
+def get_current_user_optional(authorization: str = Header(default="")):
+    if not authorization.startswith("Bearer "):
+        return None
+    return verify_jwt(authorization[7:])
+
+
+def get_current_user(authorization: str = Header(default="")):
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    payload = verify_jwt(authorization[7:])
+    if not payload:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    return payload
+
+
+# --- Auth Routes ---
+
+class RegisterRequest(SQLModel):
+    name: str
+    email: str
+
+class SendCodeRequest(SQLModel):
+    email: str
+
+class VerifyCodeRequest(SQLModel):
+    email: str
+    code: str
+
+class PasswordLoginRequest(SQLModel):
+    email: str
+    password: str
+
+
+@app.post("/auth/login")
+def auth_login_password(req: PasswordLoginRequest):
+    with Session(engine) as session:
+        result = auth_service.login_with_password(session, req.email, req.password)
+        if "error" in result:
+            raise HTTPException(status_code=401, detail=result["message"])
+        return result
+
+
+@app.post("/auth/register")
+def auth_register(req: RegisterRequest):
+    with Session(engine) as session:
+        result = auth_service.register_user(session, req.name, req.email)
+        if "error" in result:
+            status_code = 409 if result["error"] == "email_exists" else 400
+            raise HTTPException(status_code=status_code, detail=result["message"])
+        return result
+
+
+@app.post("/auth/send-code")
+def auth_send_code(req: SendCodeRequest):
+    with Session(engine) as session:
+        result = auth_service.send_login_code(session, req.email)
+        if "error" in result:
+            code_map = {"not_found": 404, "pending": 403, "not_activated": 403, "rejected": 403}
+            raise HTTPException(status_code=code_map.get(result["error"], 400), detail=result["message"])
+        return result
+
+
+@app.post("/auth/verify")
+def auth_verify(req: VerifyCodeRequest):
+    with Session(engine) as session:
+        result = auth_service.verify_login_code(session, req.email, req.code)
+        if "error" in result:
+            raise HTTPException(status_code=401, detail=result["message"])
+        return result
+
+
+@app.get("/auth/approve")
+def auth_approve(token: str):
+    with Session(engine) as session:
+        result = auth_service.approve_user(session, token)
+        from fastapi.responses import HTMLResponse
+        if "error" in result:
+            return HTMLResponse(content=f'<html><body style="background:#1a1a2e;color:#f1f5f9;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0"><div style="text-align:center"><h1 style="color:#ef4444">Error</h1><p>{result["message"]}</p></div></body></html>')
+        return HTMLResponse(content=f'<html><body style="background:#1a1a2e;color:#f1f5f9;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0"><div style="text-align:center"><h1 style="color:#22c55e">Approved!</h1><p>{result["message"]}</p></div></body></html>')
+
+
+@app.get("/auth/reject")
+def auth_reject(token: str):
+    with Session(engine) as session:
+        result = auth_service.reject_user(session, token)
+        from fastapi.responses import HTMLResponse
+        if "error" in result:
+            return HTMLResponse(content=f'<html><body style="background:#1a1a2e;color:#f1f5f9;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0"><div style="text-align:center"><h1 style="color:#ef4444">Error</h1><p>{result["message"]}</p></div></body></html>')
+        return HTMLResponse(content=f'<html><body style="background:#1a1a2e;color:#f1f5f9;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0"><div style="text-align:center"><h1 style="color:#f59e0b">Rejected</h1><p>{result["message"]}</p></div></body></html>')
+
+
+@app.get("/auth/activate")
+def auth_activate(token: str):
+    from backend.app.services.auth_service import APP_URL as _APP_URL
+    with Session(engine) as session:
+        result = auth_service.activate_user(session, token)
+        from fastapi.responses import HTMLResponse
+        if "error" in result:
+            return HTMLResponse(content=f'<html><body style="background:#1a1a2e;color:#f1f5f9;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0"><div style="text-align:center"><h1 style="color:#ef4444">Error</h1><p>{result["message"]}</p></div></body></html>')
+        return HTMLResponse(content=f'<html><body style="background:#1a1a2e;color:#f1f5f9;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0"><div style="text-align:center"><h1 style="color:#22c55e">Account Activated!</h1><p>{result["message"]}</p><a href="{_APP_URL}" style="display:inline-block;background:#22c55e;color:#000;padding:14px 32px;border-radius:8px;text-decoration:none;font-weight:600;margin-top:20px">Go to HeartMuLa Studio</a></div></body></html>')
+
+
+@app.get("/auth/me")
+def auth_me(user=Depends(get_current_user)):
+    with Session(engine) as session:
+        db_user = session.exec(select(User).where(User.id == UUID(user["sub"]))).first()
+        if not db_user:
+            raise HTTPException(status_code=404, detail="User not found")
+        return {"id": str(db_user.id), "name": db_user.name, "email": db_user.email, "status": db_user.status, "is_admin": db_user.is_admin}
+
 
 # --- Routes ---
 
@@ -130,7 +286,8 @@ def health_check():
 
 @app.get("/models/lyrics")
 def get_lyrics_models():
-    return {"models": LLMService.get_models()}
+    """Get all active (enabled) models across all providers."""
+    return {"models": LLMService.get_active_models()}
 
 @app.get("/languages")
 def get_languages():
@@ -142,7 +299,6 @@ def enhance_prompt(req: EnhancePromptRequest):
         result = LLMService.enhance_prompt(req.concept, req.model_name, req.provider)
         return result
     except Exception as e:
-        # Fallback
         return {"topic": req.concept, "tags": "Pop"}
 
 @app.post("/generate/evaluate_inspiration")
@@ -155,17 +311,16 @@ def generate_inspiration(req: InspirationRequest):
 
 @app.post("/generate/styles")
 def generate_styles(req: InspirationRequest):
-    # Reusing InspirationRequest since we just need the model_name
     try:
         styles = LLMService.generate_styles_list(req.model_name)
         return {"styles": styles}
     except Exception:
-        return {"styles": ["Pop", "Rock", "Jazz"]} # Fallback
+        return {"styles": ["Pop", "Rock", "Jazz"]}
 
 @app.post("/generate/lyrics")
 def generate_lyrics(req: LyricsRequest):
     try:
-        result = LLMService.generate_lyrics(req.topic, req.model_name, req.seed_lyrics, req.provider, req.language)
+        result = LLMService.generate_lyrics(req.topic, req.model_name, req.seed_lyrics, req.provider, req.language, req.duration_seconds)
         return {
             "lyrics": result["lyrics"],
             "suggested_topic": result.get("suggested_topic", req.topic),
@@ -284,6 +439,112 @@ def cancel_job(job_id: UUID):
             return {"status": "cancelled", "id": job_id}
             
     raise HTTPException(status_code=400, detail="Job not active or already completed")
+
+# ============== TRANSCRIPTION (HeartTranscriptor) ==============
+
+@app.get("/transcriptor/status")
+def get_transcriptor_status():
+    """Get HeartTranscriptor service status."""
+    return transcription_service.get_status()
+
+
+@app.post("/transcriptor/download")
+async def download_transcriptor(background_tasks: BackgroundTasks):
+    """Download HeartTranscriptor model from HuggingFace."""
+    if transcription_service.is_loading:
+        raise HTTPException(status_code=409, detail="Model is already being downloaded/loaded")
+
+    if transcription_service.check_model_exists():
+        return {"status": "already_downloaded", "message": "HeartTranscriptor model already exists"}
+
+    background_tasks.add_task(transcription_service.download_model)
+    return {"status": "downloading", "message": "HeartTranscriptor download started (~1.5GB)"}
+
+
+@app.post("/transcriptor/load")
+async def load_transcriptor():
+    """Load HeartTranscriptor model into GPU memory."""
+    if transcription_service.is_loading:
+        raise HTTPException(status_code=409, detail="Model is already loading")
+
+    if transcription_service.is_ready:
+        return {"status": "already_loaded", "message": "HeartTranscriptor is already loaded"}
+
+    if not transcription_service.check_model_exists():
+        raise HTTPException(status_code=404, detail="Model not downloaded. Call /transcriptor/download first")
+
+    success = await transcription_service.load_model()
+    if success:
+        return {"status": "loaded", "message": "HeartTranscriptor loaded successfully"}
+    raise HTTPException(status_code=500, detail="Failed to load HeartTranscriptor")
+
+
+@app.post("/transcriptor/unload")
+def unload_transcriptor():
+    """Unload HeartTranscriptor from GPU memory to free VRAM."""
+    transcription_service.unload_model()
+    return {"status": "unloaded", "message": "HeartTranscriptor unloaded from GPU memory"}
+
+
+@app.post("/transcriptor/transcribe")
+async def transcribe_audio(file: UploadFile = File(...), use_demucs: bool = False):
+    """
+    Transcribe lyrics from an uploaded audio file.
+
+    - **file**: Audio file (mp3, wav, flac, ogg)
+    - **use_demucs**: Set to true for vocal separation before transcription (better accuracy, slower)
+    """
+    # Validate file type
+    allowed_types = ["audio/mpeg", "audio/mp3", "audio/wav", "audio/x-wav", "audio/flac", "audio/ogg"]
+    if file.content_type and file.content_type not in allowed_types:
+        raise HTTPException(status_code=400, detail=f"Invalid file type: {file.content_type}. Allowed: mp3, wav, flac, ogg")
+
+    # Save uploaded file to temp location
+    import tempfile
+    ext = os.path.splitext(file.filename or "audio.mp3")[1] or ".mp3"
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext, prefix="heartmula_transcribe_")
+    try:
+        contents = await file.read()
+        tmp.write(contents)
+        tmp.close()
+
+        # Transcribe
+        result = await transcription_service.transcribe(tmp.name, use_demucs=use_demucs)
+        return result
+
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Transcription failed: {str(e)}")
+    finally:
+        # Clean up temp file
+        if os.path.exists(tmp.name):
+            os.remove(tmp.name)
+
+
+@app.post("/transcriptor/transcribe/{job_id}")
+async def transcribe_job_audio(job_id: UUID, use_demucs: bool = False):
+    """Transcribe lyrics from an existing generated track by job ID."""
+    with Session(engine) as session:
+        job = session.get(Job, job_id)
+        if not job or not job.audio_path:
+            raise HTTPException(status_code=404, detail="Track not found")
+
+    # Resolve audio file path
+    filename = job.audio_path.replace("/audio/", "")
+    file_path = f"backend/generated_audio/{filename}"
+
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="Audio file not found on disk")
+
+    try:
+        result = await transcription_service.transcribe(file_path, use_demucs=use_demucs)
+        return result
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Transcription failed: {str(e)}")
+
 
 from fastapi.responses import StreamingResponse
 from backend.app.services.music_service import event_manager
@@ -647,74 +908,263 @@ async def reload_models(settings: GPUSettingsRequest, background_tasks: Backgrou
 
 # ============== LLM SETTINGS ==============
 
-@app.get("/settings/llm", response_model=LLMSettingsResponse)
-def get_llm_settings():
-    """Get current LLM provider settings."""
-    settings = LLMService.get_settings()
-    # Mask API keys for security (show only last 4 chars)
-    openrouter_key = settings.get("openrouter_api_key", "")
-    masked_openrouter_key = f"***{openrouter_key[-4:]}" if openrouter_key and len(openrouter_key) > 4 else ""
+# ============== LLM PROVIDERS (Multi-Provider) ==============
 
-    custom_api_key = settings.get("custom_api_key", "")
-    masked_custom_key = f"***{custom_api_key[-4:]}" if custom_api_key and len(custom_api_key) > 4 else ""
+@app.get("/settings/llm/providers")
+def get_llm_providers():
+    """Get all configured LLM providers (API keys masked)."""
+    return {"providers": LLMService.get_providers()}
 
-    return {
-        "ollama_host": settings.get("ollama_host", ""),
-        "openrouter_api_key": masked_openrouter_key,
-        "ollama_available": LLMService.check_ollama_available(),
-        "openrouter_available": LLMService.check_openrouter_available(),
-        "custom_api_base_url": settings.get("custom_api_base_url", ""),
-        "custom_api_key": masked_custom_key,
-        "custom_api_model": settings.get("custom_api_model", ""),
-        "custom_api_available": LLMService.check_custom_api_available()
-    }
-
-
-@app.put("/settings/llm", response_model=LLMSettingsResponse)
-def update_llm_settings(settings: LLMSettingsRequest):
-    """Update LLM provider settings."""
-    # Update LLMService settings
-    if settings.ollama_host is not None:
-        LLMService.update_settings(ollama_host=settings.ollama_host)
-        music_service.current_settings["ollama_host"] = settings.ollama_host
-
-    if settings.openrouter_api_key is not None:
-        LLMService.update_settings(openrouter_api_key=settings.openrouter_api_key)
-        music_service.current_settings["openrouter_api_key"] = settings.openrouter_api_key
-
-    if settings.custom_api_base_url is not None:
-        LLMService.update_settings(custom_api_base_url=settings.custom_api_base_url)
-        music_service.current_settings["custom_api_base_url"] = settings.custom_api_base_url
-
-    if settings.custom_api_key is not None:
-        LLMService.update_settings(custom_api_key=settings.custom_api_key)
-        music_service.current_settings["custom_api_key"] = settings.custom_api_key
-
-    if settings.custom_api_model is not None:
-        LLMService.update_settings(custom_api_model=settings.custom_api_model)
-        music_service.current_settings["custom_api_model"] = settings.custom_api_model
-
-    # Save to persistent storage
+@app.post("/settings/llm/providers")
+def add_llm_provider(req: LLMProviderRequest):
+    """Add a new LLM provider."""
+    provider = LLMService.add_provider(
+        name=req.name or "",
+        provider_type=req.type,
+        base_url=req.base_url,
+        api_key=req.api_key or ""
+    )
+    # Save to disk
+    music_service.current_settings["llm_providers"] = LLMService.get_providers_raw()
     music_service._save_settings()
+    # Return masked
+    masked = dict(provider)
+    key = masked.get("api_key", "")
+    masked["api_key"] = f"***{key[-4:]}" if key and len(key) > 4 else ""
+    return masked
 
-    # Return updated settings
-    current = LLMService.get_settings()
-    openrouter_key = current.get("openrouter_api_key", "")
-    masked_openrouter_key = f"***{openrouter_key[-4:]}" if openrouter_key and len(openrouter_key) > 4 else ""
+@app.put("/settings/llm/providers/{provider_id}")
+def update_llm_provider(provider_id: str, req: LLMProviderRequest):
+    """Update an existing LLM provider."""
+    try:
+        updates = {}
+        if req.name is not None:
+            updates["name"] = req.name
+        if req.base_url:
+            updates["base_url"] = req.base_url
+        if req.api_key is not None:
+            updates["api_key"] = req.api_key
+        if req.enabled is not None:
+            updates["enabled"] = req.enabled
+        if req.type:
+            updates["type"] = req.type
 
-    custom_api_key = current.get("custom_api_key", "")
-    masked_custom_key = f"***{custom_api_key[-4:]}" if custom_api_key and len(custom_api_key) > 4 else ""
+        provider = LLMService.update_provider(provider_id, **updates)
+        music_service.current_settings["llm_providers"] = LLMService.get_providers_raw()
+        music_service._save_settings()
+
+        masked = dict(provider)
+        key = masked.get("api_key", "")
+        masked["api_key"] = f"***{key[-4:]}" if key and len(key) > 4 else ""
+        return masked
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+@app.delete("/settings/llm/providers/{provider_id}")
+def delete_llm_provider(provider_id: str):
+    """Delete a LLM provider."""
+    if LLMService.delete_provider(provider_id):
+        music_service.current_settings["llm_providers"] = LLMService.get_providers_raw()
+        music_service._save_settings()
+        return {"status": "deleted"}
+    raise HTTPException(status_code=404, detail="Provider not found")
+
+@app.post("/settings/llm/providers/{provider_id}/fetch-models")
+def fetch_provider_models(provider_id: str):
+    """Fetch available models from a provider's API."""
+    try:
+        models = LLMService.fetch_models(provider_id)
+        music_service.current_settings["llm_providers"] = LLMService.get_providers_raw()
+        music_service._save_settings()
+        return {"models": models}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/settings/llm/providers/{provider_id}/toggle-model")
+def toggle_provider_model(provider_id: str, req: LLMToggleModelRequest):
+    """Enable or disable a specific model for a provider."""
+    if LLMService.toggle_model(provider_id, req.model_id, req.enabled):
+        music_service.current_settings["llm_providers"] = LLMService.get_providers_raw()
+        music_service._save_settings()
+        return {"status": "ok", "model_id": req.model_id, "enabled": req.enabled}
+    raise HTTPException(status_code=404, detail="Provider not found")
+
+
+# ============== VERTEX AI / VIDEO GENERATION ==============
+
+@app.get("/settings/vertex_ai")
+def get_vertex_ai_status():
+    """Get Vertex AI configuration status."""
+    return vertex_ai_service.get_status()
+
+
+@app.post("/settings/vertex_ai")
+def configure_vertex_ai(req: VertexAISettingsRequest):
+    """Configure Vertex AI credentials."""
+    if not req.service_account_json or not req.project_id:
+        raise HTTPException(status_code=400, detail="service_account_json and project_id are required")
+    try:
+        vertex_ai_service.configure(
+            service_account_json=req.service_account_json,
+            project_id=req.project_id,
+            location=req.location or "us-central1",
+        )
+        # Save to settings
+        music_service.current_settings["vertex_ai"] = vertex_ai_service.get_settings_for_save()
+        music_service._save_settings()
+        return {"status": "ok", **vertex_ai_service.get_status()}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.delete("/settings/vertex_ai")
+def remove_vertex_ai():
+    """Remove Vertex AI credentials."""
+    vertex_ai_service._configured = False
+    vertex_ai_service._credentials = None
+    vertex_ai_service._project_id = None
+    vertex_ai_service._credentials_json = None
+    music_service.current_settings.pop("vertex_ai", None)
+    music_service._save_settings()
+    return {"status": "removed"}
+
+
+@app.post("/generate/video")
+async def generate_video(req: VideoGenerateRequest, background_tasks: BackgroundTasks):
+    """Start AI music video generation for a song."""
+    if not vertex_ai_service.is_configured():
+        raise HTTPException(status_code=400, detail="Vertex AI not configured. Go to Settings > Vertex AI.")
+
+    # Find the music job
+    with Session(engine) as session:
+        job = session.exec(select(Job).where(Job.id == UUID(req.job_id))).first()
+        if not job:
+            raise HTTPException(status_code=404, detail="Music job not found")
+        if job.status != JobStatus.COMPLETED:
+            raise HTTPException(status_code=400, detail="Music generation must be completed first")
+        if not job.audio_path:
+            raise HTTPException(status_code=400, detail="No audio file found for this job")
+
+        # Create video job
+        video_job = VideoJob(
+            job_id=UUID(req.job_id),
+            mode=req.mode,
+            custom_prompt=req.custom_prompt,
+            style_preset=req.style_preset,
+        )
+        session.add(video_job)
+        session.commit()
+        session.refresh(video_job)
+        video_job_id = str(video_job.id)
+
+        # Resolve audio path
+        audio_path = job.audio_path
+        if audio_path.startswith("/audio/"):
+            audio_path = os.path.join("backend/generated_audio", audio_path.replace("/audio/", ""))
+
+        # Start background generation
+        background_tasks.add_task(
+            video_service.generate_video,
+            video_job_id=video_job_id,
+            music_job_id=req.job_id,
+            audio_path=audio_path,
+            title=job.title or "",
+            lyrics=job.lyrics or "",
+            tags=job.tags or "",
+            duration_ms=job.duration_ms,
+            mode=req.mode,
+            custom_prompt=req.custom_prompt,
+            style_preset=req.style_preset,
+            db_engine=engine,
+            event_manager=event_manager,
+        )
 
     return {
-        "ollama_host": current.get("ollama_host", ""),
-        "openrouter_api_key": masked_openrouter_key,
-        "ollama_available": LLMService.check_ollama_available(),
-        "openrouter_available": LLMService.check_openrouter_available(),
-        "custom_api_base_url": current.get("custom_api_base_url", ""),
-        "custom_api_key": masked_custom_key,
-        "custom_api_model": current.get("custom_api_model", ""),
-        "custom_api_available": LLMService.check_custom_api_available()
+        "video_job_id": video_job_id,
+        "status": "queued",
+        "message": "Video generation started",
     }
+
+
+@app.get("/video_jobs/{video_job_id}")
+def get_video_job(video_job_id: str):
+    """Get video job status and details."""
+    with Session(engine) as session:
+        job = session.exec(
+            select(VideoJob).where(VideoJob.id == UUID(video_job_id))
+        ).first()
+        if not job:
+            raise HTTPException(status_code=404, detail="Video job not found")
+        return {
+            "id": str(job.id),
+            "job_id": str(job.job_id),
+            "status": job.status,
+            "mode": job.mode,
+            "style_preset": job.style_preset,
+            "total_clips": job.total_clips,
+            "completed_clips": job.completed_clips,
+            "video_path": job.video_path,
+            "error_msg": job.error_msg,
+            "created_at": job.created_at.isoformat(),
+            "generation_time_seconds": job.generation_time_seconds,
+        }
+
+
+@app.post("/video_jobs/{video_job_id}/cancel")
+def cancel_video_job(video_job_id: str):
+    """Cancel a running video generation job."""
+    if video_service.cancel_job(video_job_id):
+        return {"status": "cancelling", "video_job_id": video_job_id}
+    raise HTTPException(status_code=404, detail="Video job not found or not active")
+
+
+@app.get("/jobs/{job_id}/video")
+def get_latest_video_for_song(job_id: str):
+    """Get the latest video job for a music track."""
+    with Session(engine) as session:
+        video_job = session.exec(
+            select(VideoJob)
+            .where(VideoJob.job_id == UUID(job_id))
+            .order_by(VideoJob.created_at.desc())
+        ).first()
+        if not video_job:
+            return {"video_job": None}
+        return {
+            "video_job": {
+                "id": str(video_job.id),
+                "status": video_job.status,
+                "video_path": video_job.video_path,
+                "style_preset": video_job.style_preset,
+                "total_clips": video_job.total_clips,
+                "completed_clips": video_job.completed_clips,
+                "error_msg": video_job.error_msg,
+                "generation_time_seconds": video_job.generation_time_seconds,
+            }
+        }
+
+
+@app.get("/download_video/{video_job_id}")
+def download_video(video_job_id: str):
+    """Download generated video file."""
+    with Session(engine) as session:
+        job = session.exec(
+            select(VideoJob).where(VideoJob.id == UUID(video_job_id))
+        ).first()
+        if not job or not job.video_path:
+            raise HTTPException(status_code=404, detail="Video not found")
+
+        # video_path is like /video/{job_id}/music_video.mp4
+        file_path = os.path.join(VIDEO_OUTPUT_DIR, video_job_id, "music_video.mp4")
+        if not os.path.exists(file_path):
+            raise HTTPException(status_code=404, detail="Video file not found on disk")
+
+        return FileResponse(
+            file_path,
+            media_type="video/mp4",
+            filename=f"music_video_{video_job_id[:8]}.mp4",
+        )
 
 
 # ============== FRONTEND STATIC FILES (Docker Production) ==============

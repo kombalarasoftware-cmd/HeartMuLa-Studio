@@ -4,6 +4,45 @@ from uuid import UUID, uuid4
 from sqlmodel import Field, SQLModel
 from enum import Enum
 
+# ============== Auth Models ==============
+
+class UserStatus(str, Enum):
+    PENDING = "pending"          # Waiting for admin approval
+    APPROVED = "approved"        # Admin approved, waiting for user activation
+    ACTIVE = "active"            # User activated account
+    REJECTED = "rejected"        # Admin rejected
+    SUSPENDED = "suspended"      # Account suspended
+
+
+class CodeType(str, Enum):
+    ADMIN_APPROVAL = "admin_approval"
+    USER_ACTIVATION = "user_activation"
+    LOGIN_CODE = "login_code"
+
+
+class User(SQLModel, table=True):
+    id: Optional[UUID] = Field(default_factory=uuid4, primary_key=True)
+    name: str
+    email: str = Field(index=True, unique=True)
+    password_hash: Optional[str] = Field(default=None)
+    is_admin: bool = Field(default=False)
+    status: UserStatus = Field(default=UserStatus.PENDING)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    last_login: Optional[datetime] = None
+
+
+class VerificationCode(SQLModel, table=True):
+    id: Optional[UUID] = Field(default_factory=uuid4, primary_key=True)
+    user_id: UUID = Field(index=True)
+    code: str = Field(index=True)
+    code_type: CodeType
+    used: bool = Field(default=False)
+    expires_at: datetime
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+# ============== Music Models ==============
+
 class JobStatus(str, Enum):
     QUEUED = "queued"
     PROCESSING = "processing"
@@ -52,6 +91,7 @@ class LyricsRequest(SQLModel):
     seed_lyrics: Optional[str] = None
     provider: str = "ollama"
     language: str = "English"
+    duration_seconds: Optional[int] = None  # Target song duration for structure planning
 
 class EnhancePromptRequest(SQLModel):
     model_config = {"protected_namespaces": ()}
@@ -152,22 +192,85 @@ class ModelReloadResponse(SQLModel):
     message: str
 
 
-# ============== LLM Settings Models ==============
+# ============== LLM Provider Models ==============
 
-class LLMSettingsRequest(SQLModel):
-    ollama_host: Optional[str] = None
-    openrouter_api_key: Optional[str] = None
-    custom_api_base_url: Optional[str] = None
-    custom_api_key: Optional[str] = None
-    custom_api_model: Optional[str] = None
+class LLMProviderModel(SQLModel):
+    """A single model from a provider."""
+    id: str
+    name: str
 
 
-class LLMSettingsResponse(SQLModel):
-    ollama_host: str
-    openrouter_api_key: str  # Will be masked in response
-    ollama_available: bool
-    openrouter_available: bool
-    custom_api_base_url: str
-    custom_api_key: str  # Will be masked in response
-    custom_api_model: str
-    custom_api_available: bool
+class LLMProviderRequest(SQLModel):
+    """Request to add/update a provider."""
+    name: Optional[str] = None
+    type: str = "openai"  # "openai" | "ollama"
+    base_url: str = ""
+    api_key: Optional[str] = None
+    enabled: Optional[bool] = None
+
+
+class LLMProviderResponse(SQLModel):
+    """A provider with masked API key."""
+    id: str
+    name: str
+    type: str
+    base_url: str
+    api_key: str  # masked
+    enabled: bool
+    models: list  # List[LLMProviderModel]
+    enabled_models: list  # List[str]
+
+
+class LLMToggleModelRequest(SQLModel):
+    """Request to enable/disable a model."""
+    model_id: str
+    enabled: bool
+
+
+class LLMActiveModel(SQLModel):
+    """An active (enabled) model for the dropdown."""
+    id: str
+    name: str
+    provider_id: str
+    provider_name: str
+    provider_type: str
+
+
+# ============== Video Job Models ==============
+
+class VideoJobStatus(str, Enum):
+    QUEUED = "queued"
+    GENERATING_PROMPTS = "generating_prompts"
+    GENERATING_CLIPS = "generating_clips"
+    MERGING = "merging"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class VideoJob(SQLModel, table=True):
+    id: Optional[UUID] = Field(default_factory=uuid4, primary_key=True)
+    job_id: UUID = Field(index=True)  # FK -> Job (şarkı referansı)
+    status: VideoJobStatus = Field(default=VideoJobStatus.QUEUED)
+    mode: str = "auto"  # "auto" | "manual"
+    custom_prompt: Optional[str] = None
+    style_preset: str = "cinematic"  # cinematic, anime, realistic, abstract
+    scene_prompts: Optional[str] = None  # JSON string — sahne listesi
+    total_clips: int = 0
+    completed_clips: int = 0
+    video_path: Optional[str] = None
+    error_msg: Optional[str] = None
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    generation_time_seconds: Optional[float] = None
+
+
+class VideoGenerateRequest(SQLModel):
+    job_id: str  # Şarkı job ID
+    mode: str = "auto"  # "auto" | "manual"
+    custom_prompt: Optional[str] = None
+    style_preset: str = "cinematic"
+
+
+class VertexAISettingsRequest(SQLModel):
+    service_account_json: Optional[str] = None  # JSON içerik (string)
+    project_id: Optional[str] = None
+    location: Optional[str] = "us-central1"

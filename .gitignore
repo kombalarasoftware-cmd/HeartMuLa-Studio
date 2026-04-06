@@ -55,3 +55,20 @@ backend/generated_tokens/*
 
 # Downloaded models (large files)
 backend/models/
+
+# Service account keys
+*.json
+!package.json
+!package-lock.json
+!tsconfig.json
+!tsconfig.*.json
+!postcss.config.json
+
+# Generated videos
+backend/generated_videos/
+
+# Runtime DB & settings
+backend/db/
+
+# Claude Code local
+.claude/

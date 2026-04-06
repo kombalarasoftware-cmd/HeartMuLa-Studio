@@ -1,6 +1,7 @@
-import React from 'react';
-import { X, Clock, Settings, FileText, Tag, Heart, ListPlus } from 'lucide-react';
+import React, { useState } from 'react';
+import { X, Clock, Settings, FileText, Tag, Heart, ListPlus, Mic, Loader2, Copy, Check, Video } from 'lucide-react';
 import type { Job } from '../api';
+import { api } from '../api';
 import { AlbumCoverLarge } from './AlbumCover';
 
 interface TrackDetailsSidebarProps {
@@ -10,6 +11,8 @@ interface TrackDetailsSidebarProps {
     isLiked?: boolean;
     onToggleLike?: () => void;
     onAddToPlaylist?: () => void;
+    onUseLyrics?: (lyrics: string) => void;
+    onGenerateVideo?: () => void;
 }
 
 export const TrackDetailsSidebar: React.FC<TrackDetailsSidebarProps> = ({
@@ -18,8 +21,15 @@ export const TrackDetailsSidebar: React.FC<TrackDetailsSidebarProps> = ({
     darkMode = false,
     isLiked = false,
     onToggleLike,
-    onAddToPlaylist
+    onAddToPlaylist,
+    onUseLyrics,
+    onGenerateVideo
 }) => {
+    const [isTranscribing, setIsTranscribing] = useState(false);
+    const [transcribedText, setTranscribedText] = useState<string | null>(null);
+    const [transcribeError, setTranscribeError] = useState<string | null>(null);
+    const [copied, setCopied] = useState(false);
+
     if (!track) return null;
 
     const formatDuration = (ms?: number) => {
@@ -92,6 +102,19 @@ export const TrackDetailsSidebar: React.FC<TrackDetailsSidebarProps> = ({
                         >
                             <ListPlus className="w-5 h-5" />
                         </button>
+                        {track.status === 'completed' && (
+                            <button
+                                onClick={onGenerateVideo}
+                                className={`p-3 rounded-full border transition-all ${
+                                    darkMode
+                                        ? 'border-[#404040] text-[#b3b3b3] hover:border-[#1DB954] hover:text-[#1DB954]'
+                                        : 'border-slate-200 text-slate-400 hover:border-cyan-500 hover:text-cyan-500'
+                                }`}
+                                title="Generate Music Video"
+                            >
+                                <Video className="w-5 h-5" />
+                            </button>
+                        )}
                     </div>
                 </div>
 
@@ -151,6 +174,99 @@ export const TrackDetailsSidebar: React.FC<TrackDetailsSidebarProps> = ({
                         <div className={`rounded-lg p-4 text-sm leading-relaxed whitespace-pre-line ${darkMode ? 'bg-[#282828] text-[#b3b3b3]' : 'bg-slate-50 text-slate-600'}`}>
                             {track.lyrics}
                         </div>
+                    </div>
+                )}
+
+                {/* Transcribe Lyrics */}
+                {track.audio_path && track.status === 'completed' && (
+                    <div>
+                        <div className={`flex items-center gap-2 mb-3 ${darkMode ? 'text-[#b3b3b3]' : 'text-slate-600'}`}>
+                            <Mic className="w-4 h-4" />
+                            <span className="text-xs font-semibold uppercase tracking-wide">Transcribe Lyrics</span>
+                        </div>
+
+                        {!transcribedText && !isTranscribing && (
+                            <button
+                                onClick={async () => {
+                                    setIsTranscribing(true);
+                                    setTranscribeError(null);
+                                    try {
+                                        const result = await api.transcribeJobAudio(track.id);
+                                        setTranscribedText(result.text);
+                                    } catch (err: any) {
+                                        const msg = err?.response?.data?.detail || err?.message || 'Transcription failed';
+                                        setTranscribeError(msg);
+                                    } finally {
+                                        setIsTranscribing(false);
+                                    }
+                                }}
+                                className={`w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg text-sm font-medium transition-all ${
+                                    darkMode
+                                        ? 'bg-[#282828] text-white hover:bg-[#383838] border border-[#404040]'
+                                        : 'bg-slate-100 text-slate-700 hover:bg-slate-200 border border-slate-200'
+                                }`}
+                            >
+                                <Mic className="w-4 h-4" />
+                                Extract Lyrics from Audio
+                            </button>
+                        )}
+
+                        {isTranscribing && (
+                            <div className={`flex items-center justify-center gap-2 px-4 py-3 rounded-lg text-sm ${
+                                darkMode ? 'bg-[#282828] text-[#b3b3b3]' : 'bg-slate-50 text-slate-500'
+                            }`}>
+                                <Loader2 className="w-4 h-4 animate-spin" />
+                                Transcribing... This may take a moment
+                            </div>
+                        )}
+
+                        {transcribeError && (
+                            <div className={`px-4 py-3 rounded-lg text-sm ${
+                                darkMode ? 'bg-red-900/20 text-red-400' : 'bg-red-50 text-red-600'
+                            }`}>
+                                {transcribeError}
+                            </div>
+                        )}
+
+                        {transcribedText && (
+                            <div className="space-y-2">
+                                <div className={`rounded-lg p-4 text-sm leading-relaxed whitespace-pre-line ${
+                                    darkMode ? 'bg-[#282828] text-[#b3b3b3]' : 'bg-slate-50 text-slate-600'
+                                }`}>
+                                    {transcribedText}
+                                </div>
+                                <div className="flex gap-2">
+                                    <button
+                                        onClick={() => {
+                                            navigator.clipboard.writeText(transcribedText);
+                                            setCopied(true);
+                                            setTimeout(() => setCopied(false), 2000);
+                                        }}
+                                        className={`flex-1 flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg text-xs font-medium transition-all ${
+                                            darkMode
+                                                ? 'bg-[#282828] text-[#b3b3b3] hover:bg-[#383838]'
+                                                : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+                                        }`}
+                                    >
+                                        {copied ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                                        {copied ? 'Copied!' : 'Copy'}
+                                    </button>
+                                    {onUseLyrics && (
+                                        <button
+                                            onClick={() => onUseLyrics(transcribedText)}
+                                            className={`flex-1 flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg text-xs font-medium transition-all ${
+                                                darkMode
+                                                    ? 'bg-[#1DB954] text-black hover:bg-[#1ed760]'
+                                                    : 'bg-indigo-500 text-white hover:bg-indigo-600'
+                                            }`}
+                                        >
+                                            <FileText className="w-3.5 h-3.5" />
+                                            Use in Composer
+                                        </button>
+                                    )}
+                                </div>
+                            </div>
+                        )}
                     </div>
                 )}
 

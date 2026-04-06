@@ -1,53 +1,53 @@
 services:
   heartmula:
-    # Use pre-built image from GitHub Container Registry (faster)
-    # image: ghcr.io/fspecii/heartmula-studio:latest
-    # Or build locally: uncomment the lines below and comment out the image line above
     build:
       context: .
       dockerfile: Dockerfile
     container_name: heartmula-studio
 
-    # GPU access - requires NVIDIA Container Toolkit
+    # GPU access - NVIDIA Container Toolkit (Docker Desktop WSL2)
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
-              count: all  # Use all available GPUs
+              count: all
               capabilities: [gpu]
 
     ports:
       - "8000:8000"
 
-    # Allow container to reach host services (Ollama)
+    # Ollama için host erişimi
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
     volumes:
-      # Persist models (auto-downloaded on first run, ~5GB)
-      - ./backend/models:/app/backend/models
-      # Persist generated music (accessible from host)
-      - ./backend/generated_audio:/app/backend/generated_audio
-      # Persist reference audio uploads
-      - ./backend/ref_audio:/app/backend/ref_audio
-      # Persist database (song history) - uses named volume
-      - heartmula-db:/app/backend/db
+      # Backend kodu (geliştirme için mount)
+      - ./backend:/app/backend
+      # Kalıcı veriler zaten backend/ altında
 
     environment:
-      # Force single GPU for testing
       - CUDA_VISIBLE_DEVICES=0
-      # GPU auto-detection (recommended)
-      - HEARTMULA_4BIT=auto
-      - HEARTMULA_SEQUENTIAL_OFFLOAD=auto
-      # PyTorch memory optimization
+      # RTX 5080 16GB - 4bit açık, offload kapalı (hızlı)
+      - HEARTMULA_4BIT=true
+      - HEARTMULA_SEQUENTIAL_OFFLOAD=false
       - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-      # HuggingFace cache location
       - HF_HOME=/app/backend/models
-      # Database location (for Docker)
       - HEARTMULA_DB_PATH=/app/backend/db/jobs.db
-      # Ollama on host machine (for AI lyrics generation)
       - OLLAMA_HOST=http://host.docker.internal:11434
+      - HF_TOKEN=${HF_TOKEN:-}
+      - CUSTOM_API_BASE_URL=${CUSTOM_API_BASE_URL:-https://api.openai.com/v1}
+      - CUSTOM_API_KEY=${CUSTOM_API_KEY:-}
+      - CUSTOM_API_MODEL=${CUSTOM_API_MODEL:-gpt-4o-mini}
+      # Auth & SMTP (Brevo)
+      - SMTP_HOST=${SMTP_HOST:-smtp-relay.brevo.com}
+      - SMTP_PORT=${SMTP_PORT:-587}
+      - SMTP_USER=${SMTP_USER:-}
+      - SMTP_PASS=${SMTP_PASS:-}
+      - SMTP_FROM=${SMTP_FROM:-info@telekomone.net}
+      - ADMIN_EMAIL=${ADMIN_EMAIL:-cmutlu2006@hotmail.com}
+      - APP_URL=http://localhost:8000
+      - JWT_SECRET=${JWT_SECRET:-}
 
     restart: unless-stopped
 
@@ -56,8 +56,4 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 120s  # Model loading takes time
-
-# Named volume for database persistence
-volumes:
-  heartmula-db:
+      start_period: 120s

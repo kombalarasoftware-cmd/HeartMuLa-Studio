@@ -362,7 +362,7 @@ class HeartMuLaPipeline:
                 print(f"[mmgp] Using pre-quantized codec: {quantized_codec_path}", flush=True)
 
         # Look for codec weights in the codec_path directory
-        # Try quantized first, then legacy naming, then HuggingFace naming
+        # Try quantized first, then legacy naming, then HuggingFace naming, then sharded
         if quantized_codec_path:
             codec_weights_path = quantized_codec_path
         else:
@@ -370,6 +370,13 @@ class HeartMuLaPipeline:
             if not codec_weights_path.is_file():
                 # Try HuggingFace naming: model.safetensors
                 codec_weights_path = Path(codec_path) / "model.safetensors"
+            if not codec_weights_path.is_file():
+                # Try sharded HuggingFace naming: model-00001-of-NNNNN.safetensors
+                import glob as _glob
+                shards = sorted(_glob.glob(str(Path(codec_path) / "model-*.safetensors")))
+                if shards:
+                    codec_weights_path = Path(shards[0])
+                    print(f"[Pipeline] Found sharded HeartCodec weights ({len(shards)} shards), using {codec_weights_path}", flush=True)
         if not codec_weights_path.is_file():
             raise FileNotFoundError(
                 f"Expected HeartCodec weights at {codec_path}/{codec_weights_name} or model.safetensors but not found."
@@ -401,9 +408,19 @@ class HeartMuLaPipeline:
         else:
             codec_preprocess_fn = None
 
+        # Support sharded codec weights (multiple safetensors files)
+        import glob as _glob
+        codec_shard_files = sorted(_glob.glob(str(Path(codec_path) / "model-*.safetensors")))
+        if codec_shard_files and len(codec_shard_files) > 1:
+            # Sharded model — pass all shard paths as a list to mmgp
+            codec_load_path = codec_shard_files
+            print(f"[mmgp] Loading sharded HeartCodec ({len(codec_shard_files)} shards)", flush=True)
+        else:
+            codec_load_path = str(codec_weights_path)
+
         offload.load_model_data(
             self.codec,
-            str(codec_weights_path),
+            codec_load_path,
             default_dtype=self.VAE_dtype,
             writable_tensors=False,
             preprocess_sd=codec_preprocess_fn,
